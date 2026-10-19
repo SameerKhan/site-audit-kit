@@ -102,6 +102,7 @@ import json
 import os
 import re
 import socket
+import stat
 import ssl
 import sys
 import threading
@@ -213,6 +214,33 @@ def redact_url(url: str) -> str:
             out.append(f"{key}=X")
         query = "&".join(out) if plain else "X"
     return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
+
+
+# Response or request headers whose values are credentials: never printed.
+SENSITIVE_HEADERS = frozenset(("set-cookie", "cookie", "authorization", "proxy-authorization",
+                               "www-authenticate", "proxy-authenticate"))
+# Headers whose values are URLs: printed with query values replaced by X.
+URL_HEADERS = frozenset(("location", "content-location"))
+
+
+def redact_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Copy of a lower-cased header dict safe to print (see SENSITIVE_HEADERS, URL_HEADERS)."""
+    out = {}
+    for k, v in (headers or {}).items():
+        lk = k.lower() if isinstance(k, str) else k
+        if lk in SENSITIVE_HEADERS:
+            out[k] = "REDACTED"
+        elif lk in URL_HEADERS and isinstance(v, str):
+            out[k] = redact_url(v)
+        else:
+            out[k] = v
+    return out
+
+
+def redact_chain(chain: Iterable[dict]) -> List[dict]:
+    """Redirect-chain entries with their url and location values redacted."""
+    return [{k: (redact_url(v) if k in ("url", "location") and isinstance(v, str) else v)
+             for k, v in hop.items()} for hop in (chain or [])]
 
 
 def cache_bust_url(url: str, query: str) -> str:
@@ -428,14 +456,17 @@ class FetchResult:
             return self.body.decode("utf-8", errors="replace")
 
     def to_dict(self, include_body: bool = False) -> dict:
+        """A printable view: URLs, chain entries and Location values have every query value
+        replaced by X (the log's rule) and credential headers are replaced by REDACTED. The
+        result object itself keeps the real values."""
         d = {
             "ok": self.ok,
-            "url": self.url,
-            "final_url": self.final_url,
+            "url": redact_url(self.url) if isinstance(self.url, str) else self.url,
+            "final_url": redact_url(self.final_url) if self.final_url else None,
             "status": self.status,
             "reason": self.reason,
-            "headers": self.headers,
-            "chain": self.chain,
+            "headers": redact_headers(self.headers),
+            "chain": redact_chain(self.chain),
             "error": self.error,
             "error_detail": self.error_detail,
             "bytes": self.bytes_read,
@@ -655,6 +686,19 @@ class SafeFetcher:
             real = os.path.realpath(ap)
             if not real.startswith(root + os.sep):
                 raise ValueError(f"log path {ap} must resolve under {root}/ (got {real})")
+        # Checked before any request is sent: an unwritable log would otherwise surface
+        # only after the request went out, leaving it unlogged.
+        parent = os.path.dirname(ap)
+        if not os.path.isdir(parent):
+            raise ValueError(f"log folder {parent} does not exist (create it first)")
+        if not os.access(parent, os.W_OK | os.X_OK):
+            raise ValueError(f"log folder {parent} is not writable")
+        if os.path.lexists(ap):
+            st = os.lstat(ap)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"log path {ap} exists and is not a regular file")
+            if not os.access(ap, os.W_OK):
+                raise ValueError(f"log path {ap} is not writable")
         return ap
 
     def _check_url(self, url: str, *, is_redirect: bool) -> Tuple[str, str, int, str]:
@@ -1022,7 +1066,7 @@ class SafeFetcher:
             result.body = hop["body"]
             return
 
-    def fetch_cache_pair(self, url: str) -> dict:
+    def fetch_cache_pair(self, url: str, include_body: bool = False) -> dict:
         """Fetch plain and with the configured cache-bypass query; compare cache headers.
 
         A page cache can serve copies weeks older than the origin, so something seen only in
@@ -1040,8 +1084,8 @@ class SafeFetcher:
             return any(tok in blob for tok in ("MISS", "BYPASS", "DYNAMIC", "EXPIRED"))
 
         return {
-            "plain": {**plain.to_dict(), "cache": cache_view(plain)},
-            "busted": {**busted.to_dict(), "cache": cache_view(busted)},
+            "plain": {**plain.to_dict(include_body), "cache": cache_view(plain)},
+            "busted": {**busted.to_dict(include_body), "cache": cache_view(busted)},
             "origin_freshness_established": origin_fresh(plain) or origin_fresh(busted),
         }
 
@@ -1059,11 +1103,7 @@ class SafeFetcher:
             "bytes": r.bytes_read,
             "ms": r.elapsed_ms,
             "error": r.error,
-            "chain": [
-                {k: (redact_url(v) if k in ("url", "location") and isinstance(v, str) else v)
-                 for k, v in hop.items()}
-                for hop in r.chain
-            ],
+            "chain": redact_chain(r.chain),
         }
         line = json.dumps(rec, separators=(",", ":")) + "\n"
         with self._log_lock:
@@ -1131,7 +1171,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps({"ok": False, "error": "config_error", "error_detail": str(e)}))
         return 2
     if a.cache_compare:
-        out = f.fetch_cache_pair(a.url)
+        out = f.fetch_cache_pair(a.url, include_body=a.body)
         print(json.dumps(out, indent=2))
         return 0 if out["plain"]["ok"] and out["busted"]["ok"] else 1
     r = f.fetch(a.url)

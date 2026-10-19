@@ -71,6 +71,7 @@ class Base(unittest.TestCase):
     scenario_kw = {}
 
     def setUp(self):
+        os.makedirs(TEST_TMP, mode=0o700, exist_ok=True)
         self.tmp = tempfile.mkdtemp(prefix="sfsup-", dir=TEST_TMP)
         self.home = os.path.join(self.tmp, "home")
         self.base = os.path.join(self.tmp, "sfbase")
@@ -384,20 +385,15 @@ class SignalSameNameForeignCrawl(Base):
     """Ours is recorded, then a DIFFERENT crawl with the SAME name is running: never pause it."""
     scenario_kw = {"active_polls": None, "foreign_after": 2, "foreign_name": "t1"}
 
-    def test_sigterm_does_not_pause_a_same_name_crawl_that_is_not_ours(self):
-        p = self.popen()
-        deadline = time.time() + 15
-        while time.time() < deadline and not any(l.get("database_id") == "foreign-crawl-db"
-                                                 for l in self.progress_lines()):
-            time.sleep(0.02)
-        p.send_signal(signal.SIGTERM)
-        out, err = p.communicate(timeout=30)
-        self.assertEqual(p.returncode, 8, err)
+    def test_same_name_crawl_that_is_not_ours_is_never_paused(self):
+        # The supervisor stops by itself on the foreign id (ownership-lost, exit 1) and never
+        # pauses it. The signal path for the same situation is OwnershipUnit below.
+        r = self.run_sup()
+        self.assertEqual(r.returncode, 1, r.stderr)
         self.assertNotIn("sf_pause_crawl", self.sc.tools())
         st = self.state()
         self.assertEqual(st["database_id"], self.sc.my_db)
-        self.assertFalse(st["paused_on_signal"])
-        self.assertTrue(any(e["event"] == "pause_skipped" for e in st["events"]))
+        self.assertEqual(st["status"], "ownership-lost")
 
 
 class OwnershipForeignAtStart(Base):
@@ -841,6 +837,7 @@ class OwnershipUnit(unittest.TestCase):
 
     def test_recorded_id_mismatch_is_definitive(self):
         m = load_module()
+        os.makedirs(TEST_TMP, mode=0o700, exist_ok=True)
         tmp = tempfile.mkdtemp(prefix="sfsup-u-", dir=TEST_TMP)
         try:
             calls = []
@@ -880,6 +877,7 @@ class OwnershipUnit(unittest.TestCase):
 class CopyUnit(unittest.TestCase):
     def test_copy_private_never_broad_and_never_follows_dst_symlink(self):
         m = load_module()
+        os.makedirs(TEST_TMP, mode=0o700, exist_ok=True)
         tmp = tempfile.mkdtemp(prefix="sfsup-c-", dir=TEST_TMP)
         old = os.umask(0)
         try:

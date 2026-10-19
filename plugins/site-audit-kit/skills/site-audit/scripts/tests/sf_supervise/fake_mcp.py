@@ -38,6 +38,22 @@ class Scenario:
         self.hide_mine_after_finish = kw.get("hide_mine_after_finish", False)  # our id vanishes from the list
         self.same_name_old = kw.get("same_name_old", False)  # an older stored crawl also named "t1"
         self.after_load_active = kw.get("after_load_active", 0)  # progress polls showing active after a load
+        # sf_crawl reply trouble: "drop" (crawl starts, connection closed with no reply), "garbage"
+        # (crawl starts, 200 with a non-JSON body), "drop-nostart" (nothing starts, no reply),
+        # "drop-foreign" (no reply; a crawl that is not ours becomes the running one)
+        self.crawl_reply = kw.get("crawl_reply")
+        # sf_export_seo_element_urls trouble: "partial-error" (writes a partial file, then a tool
+        # error), "partial-garbage" (writes it, then a non-JSON 200 reply), "drop" (writes it, then
+        # the connection closes with no reply)
+        self.export_fail = kw.get("export_fail")
+        # progress polls after the export call during which the spider stays busy and the export
+        # keeps appending raw lines (None = forever); 0 = the export is finished when it returns
+        self.export_busy_polls = kw.get("export_busy_polls", 0)
+        self.api_message = kw.get("api_message", "All APIs / URL Inspection: 5 / 5")
+        self.export_writing = None  # the file the export is still writing, if any
+        self.export_busy_seen = 0
+        self.huge_reply = kw.get("huge_reply", 0)  # bytes of padding in every tools/call reply
+        self.finish_with_db = kw.get("finish_with_db")  # databaseId reported once the crawl is idle
         self.export_started = threading.Event()
         self.load_active_left = 0
         self.lock = threading.RLock()
@@ -67,6 +83,17 @@ class Scenario:
 
     # -- tool implementations
     def progress(self):
+        if self.export_writing is not None:
+            if self.export_busy_polls is not None and self.export_busy_seen >= self.export_busy_polls:
+                self.export_writing = None
+            else:
+                self.export_busy_seen += 1
+                with open(self.export_writing, "a") as f:
+                    f.write(json.dumps({"Address": "https://www.example.com/late?token=LATESECRET77"}) + "\n")
+                return {"apiProgress": {"message": "Exporting", "percentComplete": 50},
+                        "crawlProgress": {"active": 0, "completed": self.completed},
+                        "databaseId": self.db, "postCrawlAnalysisProgress": {"percentComplete": 100},
+                        "stateName": "SpiderActiveState"}
         if self.load_active_left > 0:
             self.load_active_left -= 1
             return {"apiProgress": {}, "crawlProgress": {"active": 1, "completed": self.completed},
@@ -83,6 +110,8 @@ class Scenario:
             self.analysis = min(100, self.analysis + self.analysis_step)
             if self.analysis >= 100:
                 self.phase = "idle"
+                if self.finish_with_db:
+                    self.db = self.finish_with_db
         if self.pause_pending is not None:
             if self.pause_pending <= 0:
                 self.phase, self.pause_pending = "paused", None
@@ -91,7 +120,7 @@ class Scenario:
         state = {"idle": "SpiderCrawlIdleState", "active": "SpiderActiveState",
                  "analysis": "CrawlAnalysisSpiderState:(Task - AggregatedProgressableTask)",
                  "paused": "SpiderPausedState", "starting": "SpiderCrawlIdleState"}[self.phase]
-        return {"apiProgress": {"message": "All APIs / URL Inspection: 5 / 5", "percentComplete": 100},
+        return {"apiProgress": {"message": self.api_message, "percentComplete": 100},
                 "crawlProgress": {"active": 3 if self.phase == "active" else 0, "completed": self.completed,
                                   "percentComplete": 50 if self.phase == "active" else 100,
                                   "waiting": 100 if self.phase == "active" else 0},
@@ -109,10 +138,18 @@ class Scenario:
             cfg = args.get("config_path", "")
             if not os.path.isabs(cfg):
                 return f"Tool error: NoSuchFileException: {cfg}", True
+            if self.crawl_reply == "drop-nostart":
+                return None, False
+            if self.crawl_reply == "drop-foreign":
+                self.db, self.phase, self.ticks = self.foreign_db, "active", 0
+                self.foreign_after = 0
+                return None, False
             self.crawl_name = args.get("crawl_name")
             self.db = self.my_db = "db-" + uuid.uuid4().hex[:8]
             self.phase = "starting" if self.never_starts else "active"
             self.ticks, self.completed = 0, 0
+            if self.crawl_reply in ("drop", "garbage"):
+                return None, False
             return "Crawl started", False
         if name == "sf_pause_crawl":
             self.pause_calls += 1
@@ -150,6 +187,14 @@ class Scenario:
                 f.write(json.dumps({"Address": "https://www.example.com/a/"}) + "\n")
                 f.write(json.dumps({"Address": "https://www.example.com/reset?token=SECRETVALUE123&lang=en"}) + "\n")
             os.chmod(dest, 0o644)
+            if self.export_busy_polls is None or self.export_busy_polls > 0:
+                self.export_writing, self.export_busy_seen = dest, 0
+            if self.export_fail == "drop":
+                return None, False
+            if self.export_fail == "partial-error":
+                return "Tool error: IOException: export interrupted", True
+            if self.export_fail == "partial-garbage":
+                return None, False
             return json.dumps({"format": "NDJSON", "path": dest, "total_records": 2,
                                "sample": "{\"Address\":\"https://www.example.com/a/\"}"}), False
         return f"Tool error: unknown tool {name}", True
@@ -212,8 +257,27 @@ def make_handler(sc):
                         finally:
                             sc.lock.acquire()
                     text, err = sc.call(p.get("name"), p.get("arguments") or {})
-                    return self.send(200, {"jsonrpc": "2.0", "id": req["id"], "result": {
-                        "content": [{"type": "text", "text": text}], "isError": err}})
+                    if text is None:
+                        if p.get("name") == "sf_crawl":
+                            mode = sc.crawl_reply
+                        elif p.get("name") == "sf_export_seo_element_urls" and sc.export_fail == "drop":
+                            mode = "drop"
+                        else:
+                            mode = "garbage"
+                        if mode == "garbage":
+                            raw = b"this is not JSON"
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(raw)))
+                            self.end_headers()
+                            self.wfile.write(raw)
+                        self.close_connection = True  # "drop": no reply at all
+                        return
+                    res = {"jsonrpc": "2.0", "id": req["id"], "result": {
+                        "content": [{"type": "text", "text": text}], "isError": err}}
+                    if sc.huge_reply:
+                        res["padding"] = "x" * sc.huge_reply
+                    return self.send(200, res)
                 return self.send(400, {"jsonrpc": "2.0", "id": req.get("id"),
                                        "error": {"code": -32601, "message": "method not found"}})
     return H

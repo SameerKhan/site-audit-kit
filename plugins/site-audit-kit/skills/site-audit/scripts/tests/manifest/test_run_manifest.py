@@ -298,7 +298,8 @@ class BuildTests(unittest.TestCase):
         man, _ = self.build(env=FakeEnv(self.home, http=http, sf_rc=3))
         self.assertEqual(man.failed_required, [])
         self.assertTrue(man.data["live"]["sf_crawls_held"])
-        self.assertEqual(man.data["live"]["status"][WWW + "/robots.txt"]["note"], "rate limited (429)")
+        self.assertEqual([e["note"] for e in man.data["live"]["status"]
+                          if e["url"] == WWW + "/robots.txt"], ["rate limited (429)"])
         self.assertEqual(self.status(man, "sf_server"), "warn")
         self.assertEqual(self.status(man, "normal_html"), "warn")
 

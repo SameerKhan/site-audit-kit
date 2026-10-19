@@ -28,7 +28,12 @@ What is scanned
     otf mp4 webm mov sqlite db seospider): never rewritten, listed as skipped-binary on stderr,
     but byte-scanned; a plain value found inside one is reported and fails the run.
   * Anything else (NUL bytes that are not UTF-16/32, control bytes, a symlink, a FIFO, a file
-    that cannot be opened): listed on stdout as `UNSCANNED: path (reason)` and the run exits 1.
+    that cannot be opened, a regular file with more than one hard link): listed on stdout as
+    `UNSCANNED: path (reason)` and the run exits 1. A hard-linked file is never rewritten or
+    chmodded (its other links, possibly outside the tree, would keep the raw bytes); copy it
+    out (cp, not ln) and run again. A link that appears after the last check, while the file
+    is being swapped, is caught by a link count on the still-open original after the swap:
+    the path is listed as UNSCANNED and the run exits 1.
     Leftover `.redact-*.tmp` files from an interrupted run are scanned like any other file.
 
 Recognised forms (case-insensitive)
@@ -73,6 +78,10 @@ Modes
   --check      read only; exit 1 and list path:line: key for every unredacted value.
   --fix-perms  BEFORE any scanning, every directory walked becomes 700 and every file 600 (via the
                open descriptor, never following a symlink). With --check it changes no content.
+               An entry that cannot be opened (mode 000) is changed with the platform's
+               no-follow chmod; where there is none (Linux) through an O_NOFOLLOW descriptor
+               (O_PATH via /proc/self/fd), and where that is unavailable too it is an error
+               (exit 2), never a chmod by name.
 
 Symlinks are never followed. A top-level PATH that is a symlink (with or without a trailing
 slash) is refused with exit 2 before anything is touched. Every file is opened with O_NOFOLLOW
@@ -594,6 +603,8 @@ def classify(f, ext):
 # ----------------------------------------------------------------------------- file processing
 
 O_READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+_O_PATH = getattr(os, "O_PATH", 0)  # Linux only
+_PROC_FD = "/proc/self/fd"
 O_DIR = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
 
 
@@ -628,33 +639,65 @@ class Run:
         except OSError as e:
             self.errors.append(f"{path}: chmod failed: {e.strerror}")
 
-    def _chmod_nofollow(self, dirfd, name, mode, path):
+    def _chmod_nofollow(self, dirfd, name, mode, path, want_dir):
+        """chmod an entry that could not be opened (mode 000), never following a symlink.
+
+        Where the platform has a no-follow chmod (macOS) it is used. Elsewhere (Linux) the
+        entry is opened with O_NOFOLLOW and changed through that descriptor: fchmod, or, for an
+        entry that cannot be opened for reading, an O_PATH descriptor changed via
+        /proc/self/fd/N. Without either, it fails closed (an error, exit 2); it never chmods by
+        name, which would follow a symlink swapped in after any check."""
         try:
+            before = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            self._check_entry(before, want_dir)
             try:
                 os.chmod(name, mode, dir_fd=dirfd, follow_symlinks=False)
             except NotImplementedError:
-                # Linux has no no-follow chmod. Only a real directory or regular file is
-                # changed (never a symlink): check the entry before, chmod relative to the open
-                # parent, and confirm it is still the same object afterwards.
-                before = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
-                if not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)):
-                    raise OSError(0, "not a regular file or directory")
-                os.chmod(name, mode, dir_fd=dirfd)
-                after = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
-                if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) or \
-                        stat.S_IFMT(after.st_mode) != stat.S_IFMT(before.st_mode):
-                    raise OSError(0, "entry changed during chmod")
+                self._chmod_by_fd(dirfd, name, mode, want_dir)
             self.s["perms_fixed"] += 1
             return True
         except OSError as e:
             self.errors.append(f"{path}: chmod failed: {getattr(e, 'strerror', None) or e}")
             return False
 
+    @staticmethod
+    def _check_entry(st, want_dir):
+        if want_dir and not stat.S_ISDIR(st.st_mode):
+            raise OSError(0, "entry is no longer a directory")
+        if not want_dir:
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(0, "entry is no longer a regular file")
+            if st.st_nlink > 1:
+                raise OSError(0, "hard-linked; not changed (copy it out first)")
+
+    def _chmod_by_fd(self, dirfd, name, mode, want_dir):
+        nofollow = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        flags = os.O_RDONLY | nofollow | (getattr(os, "O_DIRECTORY", 0) if want_dir
+                                          else os.O_NONBLOCK)
+        via_proc = False
+        try:
+            fd = os.open(name, flags, dir_fd=dirfd)
+        except PermissionError:
+            if not (_O_PATH and os.path.isdir(_PROC_FD)):
+                raise OSError(0, "cannot change permissions safely on this platform (no "
+                                 "no-follow chmod, no O_PATH with /proc); fix them by hand")
+            fd = os.open(name, _O_PATH | nofollow, dir_fd=dirfd)
+            via_proc = True
+        try:
+            # O_PATH|O_NOFOLLOW opens a symlink itself: refused here, never changed.
+            self._check_entry(os.fstat(fd), want_dir)
+            if via_proc:
+                os.chmod(f"{_PROC_FD}/{fd}", mode)
+            else:
+                os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+
     def _open_dir(self, dirfd, name, path, st):
         try:
             fd = os.open(name, O_DIR, dir_fd=dirfd)
         except PermissionError:
-            if not (self.fix_perms and self._chmod_nofollow(dirfd, name, 0o700, path)):
+            if not (self.fix_perms and self._chmod_nofollow(dirfd, name, 0o700, path, True)):
                 self.errors.append(f"{path}: cannot open directory")
                 return None
             fd = os.open(name, O_DIR, dir_fd=dirfd)
@@ -682,12 +725,15 @@ class Run:
         try:
             fd = os.open(name, O_READ, dir_fd=dirfd)
         except PermissionError:
-            self._chmod_nofollow(dirfd, name, 0o600, path)
+            self._chmod_nofollow(dirfd, name, 0o600, path, False)
             return
         except OSError:
             return  # symlink swapped in or vanished: the scan pass reports it
         try:
-            if stat.S_ISREG(os.fstat(fd).st_mode):
+            st = os.fstat(fd)
+            # a hard-linked inode is shared with paths outside the tree: left alone, and the
+            # scan pass lists it as UNSCANNED
+            if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
                 self._fchmod(fd, 0o600, path)
         finally:
             os.close(fd)
@@ -741,6 +787,10 @@ class Run:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
                 self.unscanned(path, "not a regular file")
+                return
+            if st.st_nlink > 1:
+                # Rewriting this link would leave the raw bytes under every other one.
+                self.unscanned(path, f"hard-linked, {st.st_nlink} links; copy it out first")
                 return
             if self.fix_perms:
                 self._fchmod(fd, 0o600, path)
@@ -859,14 +909,22 @@ class Run:
             if not os.path.samestat(now, st):
                 self.errors.append(f"{path}: changed during redaction; not replaced")
                 return
-            if st.st_nlink > 1:
-                self.note(f"{path} has {st.st_nlink} hard links; other links keep the old bytes")
+            if now.st_nlink > 1:
+                self.unscanned(path, f"hard-linked during the run, {now.st_nlink} links; "
+                                     "not rewritten; copy it out first")
+                return
             os.replace(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
             tmp = None
             os.fsync(dirfd)
             self.s["values"] += replaced
             self.s["files_with_hits"] += 1
             self.s["rewritten"] += 1
+            # A link made between the check above and the swap keeps the raw bytes alive: the
+            # still-open original must have no name left anywhere.
+            left = os.fstat(fd).st_nlink
+            if left != 0:
+                self.unscanned(path, f"hard link appeared during the rewrite; the original raw "
+                                     f"bytes still have {left} other link(s) outside this path")
         finally:
             os.close(tfd)
             if tmp is not None:

@@ -27,10 +27,14 @@ Three entry points, all fail closed:
     enforces the statement guard and the table, column and row allowlist of the given install.
     ``Verdict`` is truthy only when the statement is allowed; ``verdict.reasons`` says why not.
 
-``GuardedConnection(conn, install, log_path)``
-    Issues ``SET SESSION TRANSACTION READ ONLY`` first, verifies it took effect, then lets
-    only ``check_statement``-approved SQL through ``execute``. Every statement (never the
-    result rows) is appended to ``log_path`` (mode 600) as one JSON line.
+``GuardedConnection(conn, install, log_path, *, attended=False)``
+    Issues ``SET SESSION TRANSACTION READ ONLY`` first, verifies it took effect, then
+    establishes the identity (``CURRENT_USER()`` plus ``SHOW GRANTS`` through
+    ``classify_grants``) and refuses to start unless it is SELECT-only. Only with
+    ``attended=True`` (an operator watching) does a non-SELECT-only identity continue, with a
+    loud warning on stderr and in the log. After that it lets only
+    ``check_statement``-approved SQL through ``execute``. Every statement (never the result
+    rows) is appended to ``log_path`` (mode 600) as one JSON line.
 
 The guard is a filter, not a permission: the real boundary is a SELECT-only database user
 (the read-only DB user).
@@ -232,51 +236,133 @@ class InstallPolicy:
         return frozenset(f"%{h}%" for h in self.residue_hosts)
 
 
+_PREFIX_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
+_SCHEMA_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
+_EXTRA_TABLE_RE = re.compile(r"[a-z0-9_]{1,64}")
+#: Core tables an extra table may never resolve to, under any prefix: an extra table whose
+#: FULL name (prefix + extra table) ends with one of these is refused, so a split such as
+#: prefix "wp" + extra "_users", or prefix "wp_po" + extra "sts", cannot reopen them.
+_PROTECTED_BASES = _FORBIDDEN_BASES | _RESTRICTED_BASES
+
+
+def _check_prefix(prefix, where="table prefix"):
+    if not isinstance(prefix, str) or not _PREFIX_RE.fullmatch(prefix):
+        raise ValueError(f"bad {where} {prefix!r} (1 to 32 of A-Z a-z 0-9 _)")
+    return prefix
+
+
+def _check_extra_tables(prefix, extra, where):
+    """Refuse any extra table whose full resolved name is a protected core table."""
+    pre = _check_prefix(prefix).lower()
+    for t in extra:
+        if not isinstance(t, str) or not _EXTRA_TABLE_RE.fullmatch(t):
+            raise ValueError(f"{where}: bad extra table {t!r} (lowercase a-z 0-9 _ only)")
+        full = pre + t
+        hit = sorted(b for b in _PROTECTED_BASES if full.endswith(b))
+        if hit:
+            raise ValueError(f"{where}: extra table {t!r} resolves to {full!r}, which ends with "
+                             f"the core table name {hit[0]!r} (users, usermeta, comments, "
+                             "commentmeta, posts, postmeta and options can never be extra tables)")
+
+
+def _validate_policy(pol, where=None):
+    """Type and value checks every InstallPolicy must pass, however it was built.
+
+    Run on every resolution (config, a hand-built InstallPolicy, a --prefix override), so the
+    prefix and extra tables are always checked together."""
+    where = where or f"install {pol.name}"
+    if not isinstance(pol.name, str) or not pol.name:
+        raise ValueError("install name must be a non-empty string")
+    _check_prefix(pol.prefix)
+    for key in ("views", "attended_only"):
+        if not isinstance(getattr(pol, key), bool):
+            raise ValueError(f"{where}: {key} must be true or false (a JSON boolean)")
+    if pol.schema is not None and not (isinstance(pol.schema, str)
+                                       and _SCHEMA_RE.fullmatch(pol.schema)):
+        raise ValueError(f"{where}: bad schema name {pol.schema!r}")
+    if pol.views and not pol.schema:
+        raise ValueError(f"{where}: views=true needs schema")
+    for key in ("public_post_types", "option_names", "meta_keys", "meta_prefixes",
+                "template_post_types", "residue_hosts"):
+        v = getattr(pol, key)
+        if isinstance(v, (str, bytes)) or not isinstance(v, (list, tuple, frozenset, set)) \
+                or not all(isinstance(x, str) and x for x in v):
+            raise ValueError(f"{where}: {key} must be a list of strings")
+    if isinstance(pol.extra_tables, (str, bytes)) or \
+            not isinstance(pol.extra_tables, (list, tuple, frozenset, set)):
+        raise ValueError(f"{where}: extra_tables must be a list of strings")
+    _check_extra_tables(pol.prefix, pol.extra_tables, where)
+    for base, cols in pol.columns:
+        if base not in _CORE_COLUMNS or isinstance(cols, (str, bytes)) or \
+                not all(isinstance(c, str) for c in cols):
+            raise ValueError(f"{where}: bad columns entry {base!r}")
+        if not frozenset(cols) <= _CORE_COLUMNS[base] or frozenset(cols) & _NEVER_COLUMNS:
+            raise ValueError(f"{where}: columns.{base} must be WordPress core columns "
+                             "(post_password is never allowed)")
+    if not isinstance(pol.residue_meta_key, str) or \
+            not re.fullmatch(r"[A-Za-z0-9_-]+", pol.residue_meta_key):
+        raise ValueError(f"{where}: residue_meta_key must be a plain meta key")
+    return pol
+
+
 def _policy_from_settings(name, st):
-    """Build and validate an InstallPolicy from one install's config settings."""
+    """Build and validate an InstallPolicy from one install's config settings.
+
+    Values are type checked, never coerced: views and attended_only must be JSON booleans,
+    every list a list of non-empty strings, prefix 1 to 32 of [A-Za-z0-9_], schema a plain
+    identifier."""
+    where = f"install {name}"
+
     def strs(key):
         v = st.get(key)
-        if not isinstance(v, (list, tuple)) or not all(isinstance(x, str) and x for x in v):
-            raise ValueError(f"install {name}: {key} must be a list of strings")
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            raise ValueError(f"{where}: {key} must be a list of strings")
         return tuple(v)
+
+    for key in ("views", "attended_only"):
+        if not isinstance(st.get(key), bool):
+            raise ValueError(f"{where}: {key} must be true or false (a JSON boolean), "
+                             f"got {st.get(key)!r}")
+    prefix = _check_prefix(st.get("prefix"), f"{where}: table prefix")
+    # Table names are compared lowercased (MySQL on macOS and Windows folds case).
     extra = frozenset(x.lower() for x in strs("extra_tables"))
-    bad = extra & (_FORBIDDEN_BASES | _RESTRICTED_BASES)
+    bad = extra & _PROTECTED_BASES
     if bad:
-        raise ValueError(f"install {name}: extra_tables may not name {sorted(bad)}")
-    for t in extra:
-        if not re.fullmatch(r"[a-z0-9_]+", t):
-            raise ValueError(f"install {name}: bad extra table {t!r}")
-    cols = st.get("columns") or {}
+        raise ValueError(f"{where}: extra_tables may not name {sorted(bad)}")
+    _check_extra_tables(prefix, extra, where)
+    cols = st.get("columns")
     if not isinstance(cols, dict):
-        raise ValueError(f"install {name}: columns must be an object")
+        raise ValueError(f"{where}: columns must be an object")
     col_items = []
     for base, lst in cols.items():
         if base not in _CORE_COLUMNS:
-            raise ValueError(f"install {name}: columns key must be posts, postmeta or options")
-        low = frozenset(str(c).lower() for c in lst)
+            raise ValueError(f"{where}: columns key must be posts, postmeta or options")
+        if not isinstance(lst, list) or not all(isinstance(c, str) and c for c in lst):
+            raise ValueError(f"{where}: columns.{base} must be a list of strings")
+        low = frozenset(c.lower() for c in lst)
         if not low <= _CORE_COLUMNS[base] or low & _NEVER_COLUMNS:
-            raise ValueError(f"install {name}: columns.{base} must be WordPress core columns "
+            raise ValueError(f"{where}: columns.{base} must be WordPress core columns "
                              "(post_password is never allowed)")
         col_items.append((base, low))
     hosts = strs("residue_hosts")
     for h in hosts:
         if not re.fullmatch(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", h) or "%" in h or "_" in h:
-            raise ValueError(f"install {name}: bad residue host {h!r}")
+            raise ValueError(f"{where}: bad residue host {h!r}")
     rmk = st.get("residue_meta_key")
     if not isinstance(rmk, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", rmk):
-        raise ValueError(f"install {name}: residue_meta_key must be a plain meta key")
+        raise ValueError(f"{where}: residue_meta_key must be a plain meta key")
     schema = st.get("schema")
-    if schema is not None and not (isinstance(schema, str) and re.fullmatch(r"[A-Za-z0-9_$]+", schema)):
-        raise ValueError(f"install {name}: bad schema name {schema!r}")
-    if st.get("views") and not schema:
-        raise ValueError(f"install {name}: views=true needs schema")
-    return InstallPolicy(
-        name=name, prefix=st.get("prefix", "wp_"), views=bool(st.get("views")), schema=schema,
-        public_post_types=strs("public_post_types"), attended_only=bool(st.get("attended_only")),
+    if schema is not None and not (isinstance(schema, str) and _SCHEMA_RE.fullmatch(schema)):
+        raise ValueError(f"{where}: bad schema name {schema!r}")
+    if st["views"] and not schema:
+        raise ValueError(f"{where}: views=true needs schema")
+    return _validate_policy(InstallPolicy(
+        name=name, prefix=prefix, views=st["views"], schema=schema,
+        public_post_types=strs("public_post_types"), attended_only=st["attended_only"],
         option_names=frozenset(strs("option_names")), meta_keys=frozenset(strs("meta_keys")),
         meta_prefixes=strs("meta_prefixes"), template_post_types=frozenset(strs("template_post_types")),
         extra_tables=extra, columns=tuple(sorted(col_items)), residue_hosts=hosts,
-        residue_meta_key=rmk)
+        residue_meta_key=rmk))
 
 
 def load_installs(cfg=None):
@@ -330,9 +416,9 @@ def _resolve_policy(install, prefix=None, public_post_types=None, schema=None) -
         changes["schema"] = schema
     if changes:
         pol = InstallPolicy(**{**pol.__dict__, **changes})
-    if not re.fullmatch(r"[A-Za-z0-9_]+", pol.prefix or ""):
-        raise ValueError(f"bad table prefix {pol.prefix!r}")
-    return pol
+    # Always revalidate: a --prefix override or a hand-built InstallPolicy goes through the
+    # same prefix + extra-table full-name check as the config.
+    return _validate_policy(pol)
 
 
 # --------------------------------------------------------------------------------------
@@ -2523,8 +2609,14 @@ class GuardedConnection:
 
     On construction (and on ``reassert()``, which you must call after any reconnect):
     ``SET SESSION TRANSACTION READ ONLY``, verify ``transaction_read_only`` (MySQL 8) or
-    ``tx_read_only`` (MariaDB 10.4) is 1, and for a views install verify ``DATABASE()`` is
-    its read-only schema. Any failure raises ``GuardSetupError``.
+    ``tx_read_only`` (MariaDB 10.4) is 1, for a views install verify ``DATABASE()`` is its
+    read-only schema, then run ``identity()`` and require ``select_only`` (for a views install
+    every SELECT grant must also name only its read-only schema, or the
+    ``allowed_databases`` you pass). Any failure raises ``GuardSetupError`` and no user
+    statement ever runs. ``attended=True`` (it must be passed explicitly) lets a
+    non-SELECT-only identity (an admin alias behind the guard) continue: a ``WARNING`` line
+    goes to stderr and an ``identity_override`` record to the log. ``self.identity_result``
+    holds the last identity check.
 
     ``execute(sql)`` runs one approved statement and returns ``fetchall()`` rows; column names
     are in ``.description``. Parameters are refused (the driver would interpolate them after
@@ -2533,9 +2625,19 @@ class GuardedConnection:
     """
 
     def __init__(self, conn, install, log_path, *, prefix=None, public_post_types=None,
-                 schema=None):
+                 schema=None, attended=False, allowed_databases=None):
+        if not isinstance(attended, bool):
+            raise GuardSetupError("attended must be True or False")
         self._conn = conn
         self._policy = _resolve_policy(install, prefix, public_post_types, schema)
+        if getattr(self._policy, "attended_only", False) and not attended:
+            raise GuardSetupError(
+                f"install {self._policy.name!r} is marked attended_only; pass attended=True "
+                "only when a person is present to supervise this connection")
+        self._attended = attended
+        self._allowed_databases = allowed_databases
+        self._identity_ok = False
+        self.identity_result = None
         self._log_fd = None
         self.description = None
         self._open_log(log_path)
@@ -2598,14 +2700,42 @@ class GuardedConnection:
             raise GuardSetupError("session is not read-only after SET SESSION TRANSACTION "
                                   f"READ ONLY (got {value!r})")
         if self._policy.views:
-            rows = self.execute("SELECT DATABASE()")
+            rows = self._run("SELECT DATABASE()")
             db = rows[0][0] if rows and rows[0] else None
             if db != self._policy.schema:
                 raise GuardSetupError(f"default database is {db!r}, expected the read-only schema "
                                       f"{self._policy.schema!r}")
+        self._establish_identity()
+
+    def _establish_identity(self):
+        """Refuse every user statement unless the identity is proven SELECT-only."""
+        self._identity_ok = False
+        try:
+            result = self.identity(self._allowed_databases)
+        except GuardSetupError:
+            raise
+        except Exception as e:  # noqa: BLE001 - no identity, no statements
+            raise GuardSetupError(f"identity check failed ({type(e).__name__}); "
+                                  "nothing else will run") from None
+        if result["select_only"]:
+            self._identity_ok = True
+            return
+        if not self._attended:
+            raise GuardSetupError(
+                "identity is not SELECT-only (" + "; ".join(result["reasons"]) + "); refusing "
+                "every statement. Use the read-only DB user, or pass attended=True when an "
+                "operator is watching")
+        msg = (f"WARNING: sql_guard install {self._policy.name!r}: identity "
+               f"{result['current_user']!r} is NOT SELECT-only; continuing only because "
+               "attended=True. The statement guard is now the only boundary.")
+        print(msg, file=sys.stderr, flush=True)
+        self._log(verdict="identity_override", sql="(attended)", warning=msg)
+        self._identity_ok = True
 
     def reassert(self):
-        """Re-run the read-only setup. Call after any reconnect or tunnel fallback."""
+        """Re-run the read-only setup and the identity check. Call after any reconnect or
+        tunnel fallback."""
+        self._identity_ok = False
         self._setup()
 
     # ---- execution --------------------------------------------------------------
@@ -2613,6 +2743,16 @@ class GuardedConnection:
         return check_statement(sql, self._policy, residue=residue)
 
     def execute(self, sql, params=None, *, residue=False):
+        if not self._identity_ok:
+            if self._log_fd is not None:
+                self._log(verdict="rejected", sql=sql if isinstance(sql, str) else repr(sql),
+                          reasons=["identity not established"])
+            raise GuardSetupError("identity not established (or not SELECT-only); "
+                                  "no statement may run")
+        return self._run(sql, params, residue=residue)
+
+    def _run(self, sql, params=None, *, residue=False):
+        """Guard check and run, without the identity gate (setup and identity() only)."""
         if params is not None:
             self._log(verdict="rejected", sql=sql if isinstance(sql, str) else repr(sql),
                       reasons=["parameters refused"])
@@ -2639,11 +2779,12 @@ class GuardedConnection:
     def identity(self, allowed_databases=None):
         """Identity check: CURRENT_USER() and the SHOW GRANTS classification.
 
+        Runs on construction and on ``reassert()``; you may call it again for the report.
         For a views install the grants must also name only its read-only schema."""
         if allowed_databases is None and self._policy.views:
             allowed_databases = [self._policy.schema]
-        user_rows = self.execute("SELECT CURRENT_USER()")
-        grant_rows = self.execute("SHOW GRANTS FOR CURRENT_USER()")
+        user_rows = self._run("SELECT CURRENT_USER()")
+        grant_rows = self._run("SHOW GRANTS FOR CURRENT_USER()")
         ok, reasons = classify_grants(grant_rows, allowed_databases=allowed_databases)
         current = user_rows[0][0] if user_rows and user_rows[0] else None
         if isinstance(current, (bytes, bytearray)):
@@ -2665,9 +2806,11 @@ class GuardedConnection:
         }
         self._log(verdict="identity", sql="(summary)", select_only=ok,
                   current_user=str(result["current_user"]), reasons=reasons)
+        self.identity_result = result
         return result
 
     def close(self):
+        self._identity_ok = False
         if self._log_fd is not None:
             try:
                 os.close(self._log_fd)

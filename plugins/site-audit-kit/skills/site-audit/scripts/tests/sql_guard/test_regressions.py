@@ -19,7 +19,8 @@ import testcfg  # noqa: E402
 testcfg.use_config()
 
 import sql_guard  # noqa: E402
-from sql_guard import GuardedConnection, GuardRejected, check_statement, classify_grants  # noqa: E402
+from sql_guard import (GuardedConnection, GuardRejected, GuardSetupError, check_statement,  # noqa: E402
+                       classify_grants)
 from test_connection import FakeConnection  # noqa: E402
 
 PUB = "p.post_status = 'publish' AND p.post_type IN ('page','post')"
@@ -276,7 +277,9 @@ class IdentityFailsClosed(unittest.TestCase):
         return conn
 
     def test_no_row(self):
-        with GuardedConnection(self._conn([]), "site_ro", self.log) as g:
+        with self.assertRaises(GuardSetupError):
+            GuardedConnection(self._conn([]), "site_ro", self.log)
+        with GuardedConnection(self._conn([]), "site_ro", self.log, attended=True) as g:
             ident = g.identity()
         self.assertFalse(ident["select_only"])
         self.assertIsNone(ident["current_user"])
@@ -286,7 +289,10 @@ class IdentityFailsClosed(unittest.TestCase):
         for rows in ([(None,)], [("",)], [("   ",)], [()], [(42,)],
                      [("a@b",), ("c@d",)], [(b"\xff",)]):
             with self.subTest(rows=rows):
-                with GuardedConnection(self._conn(rows), "site_ro", self.log) as g:
+                with self.assertRaises(GuardSetupError):
+                    GuardedConnection(self._conn(rows), "site_ro", self.log)
+                with GuardedConnection(self._conn(rows), "site_ro", self.log,
+                                       attended=True) as g:
                     self.assertFalse(g.identity()["select_only"])
 
     def test_bytes_user_is_decoded(self):
@@ -351,7 +357,7 @@ class GrantTextIsRedacted(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         log = os.path.join(tmp.name, "sql.log")
         conn = FakeConnection(grants=[(line,) for line in LEAKY_GRANTS])
-        with GuardedConnection(conn, "site", log) as g:
+        with GuardedConnection(conn, "site", log, attended=True) as g:
             ident = g.identity()
         self.assertFalse(ident["select_only"])
         self.assertNotIn(HASH, json.dumps(ident))

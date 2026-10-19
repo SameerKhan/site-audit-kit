@@ -157,7 +157,8 @@ class LiveUsesSafeFetch(unittest.TestCase):
             rd = os.path.join(home, "site-audit", "run-z")
             man = rm.build(rd, "unattended", repo, env=env, cfg=CFG, sfcall="/x/sfcall.sh")
             self.assertEqual(env.fetch_log, os.path.join(os.path.realpath(rd), "fetch.log"))
-            self.assertEqual(man.data["live"]["html"][WWW + "/"]["error"], "redirect_refused")
+            self.assertEqual([e["error"] for e in man.data["live"]["html"] if e["url"] == WWW + "/"],
+                             ["redirect_refused"])
             self.assertTrue(man.data["live"]["sf_crawls_held"])
         finally:
             for d in (home, repo, tk):

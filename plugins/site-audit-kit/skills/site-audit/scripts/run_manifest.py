@@ -6,7 +6,9 @@ Usage:
                   [--baseline-dir PATH] [--first-run] [--json]
 
 Settings come from the Site Audit Kit config (--config, else $SITE_AUDIT_CONFIG, else
-~/.config/site-audit-kit/config.json); see audit_config.py and the README.
+~/.config/site-audit-kit/config.json); see audit_config.py and the README. Every child process
+(sfcall.sh included) runs with SITE_AUDIT_CONFIG set to the absolute path of the file loaded
+here, so it reads the same settings.
 
 Writes DIR/manifest.json and DIR/manifest-summary.txt (both mode 600) and prints the summary
 (or the JSON with --json). Fails closed: exit 2 when any REQUIRED item is missing, 0 otherwise.
@@ -18,7 +20,7 @@ written); a valid mode; a baseline audit (or the configured fallback; with --fir
 baseline is recorded instead); Phase 1 re-test rows parsed from that baseline (zero rows is a
 failure; phase1-rows.md is written either way and says why); for every CONFIGURED review model,
 its CLI present and answering (and listing the model where the CLI can; this does not prove the
-model itself is usable; no silent substitution); perl, curl and python3. Everything else is
+model itself is usable; no silent substitution); perl and python3. Everything else is
 ADVISORY: it is recorded with what it downgrades (for example the Screaming Frog crawls are held
 when the status or HTML health URLs fail).
 
@@ -56,7 +58,7 @@ if SCRIPT_DIR not in sys.path:
 import audit_config  # noqa: E402 - sibling module
 
 FALLBACK_STATE = "OPEN (fallback baseline)"
-REQUIRED_TOOLS = ("perl", "curl", "python3")
+REQUIRED_TOOLS = ("perl", "python3")
 OPTIONAL_TOOLS = ("gcloud", "codex", "dig", "timeout", "gtimeout")
 
 ANY_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
@@ -89,6 +91,7 @@ class Env:
     home = os.path.expanduser("~")
     fetch_log = None  # set by build() to RUN_DIR/fetch.log once the run dir is verified
     allowed_hosts = ()  # set by build() from the config's allowed_hosts
+    child_env = None  # set by build(): extra environment for every child (SITE_AUDIT_CONFIG)
 
     def now(self):
         return _dt.datetime.now(_dt.timezone.utc)
@@ -96,8 +99,9 @@ class Env:
     def run(self, argv, timeout=60):
         """Return (exit_code, stdout). exit 127 if the program is missing, 124 on timeout."""
         try:
+            env = dict(os.environ, **self.child_env) if self.child_env else None
             p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
-                               timeout=timeout, text=True, errors="replace")
+                               timeout=timeout, text=True, errors="replace", env=env)
             return p.returncode, p.stdout
         except FileNotFoundError:
             return 127, ""
@@ -696,20 +700,31 @@ def _get(env, url):
     return r if len(r) == 4 else (*r[:3], None)
 
 
+def _redact(url):
+    """A health URL as stored and printed: every query value replaced by X (safe_fetch's rule).
+    Fails closed to a placeholder if safe_fetch cannot be loaded."""
+    try:
+        return _load_safe_fetch().redact_url(url)
+    except Exception:  # noqa: BLE001
+        return "<url hidden: safe_fetch unavailable>"
+
+
 def check_live(env, m, cfg=None):
+    """GET the configured health URLs. Stored as lists of {url, status, ...} entries with the
+    URL redacted (two URLs may redact to the same string, so they are not dict keys)."""
     hc = (cfg or audit_config.DEFAULTS)["health"]
-    live = {"status": {}, "html": {}}
+    live = {"status": [], "html": []}
     m.data["live"] = live
     st_ok = True
     for url in hc["status_urls"]:
         st, ctype, body, err = _get(env, url)
         note = "rate limited (429)" if st == 429 else ""
-        live["status"][url] = {"status": st, **({"note": note} if note else {}),
-                               **({"error": err} if err else {})}
+        live["status"].append({"url": _redact(url), "status": st, **({"note": note} if note else {}),
+                               **({"error": err} if err else {})})
         st_ok = st_ok and st == 200
     if hc["status_urls"]:
         m.add("status_urls", st_ok, False,
-              ", ".join(f"{u} {v['status']}" for u, v in live["status"].items()),
+              ", ".join(f"{v['url']} {v['status']}" for v in live["status"]),
               None if st_ok else "hold the Screaming Frog crawls and report")
     else:
         m.add("status_urls", True, False, "none configured (health.status_urls)", status="not_configured")
@@ -718,13 +733,14 @@ def check_live(env, m, cfg=None):
         st, ctype, body, err = _get(env, url)
         is_html = st == 200 and "text/html" in (ctype or "").lower() and re.search(
             rb"<html|<!doctype html", body or b"", re.I) is not None
-        live["html"][url] = {"status": st, "content_type": (ctype or "").split(";")[0], "html": is_html,
-                             **({"error": err} if err else {})}
+        live["html"].append({"url": _redact(url), "status": st,
+                             "content_type": (ctype or "").split(";")[0], "html": is_html,
+                             **({"error": err} if err else {})})
         html_ok = html_ok and is_html
     if hc["html_urls"]:
         m.add("normal_html", html_ok, False,
-              ", ".join(f"{u} {v['status']} {'html' if v['html'] else 'NOT html'}"
-                        for u, v in live["html"].items()),
+              ", ".join(f"{v['url']} {v['status']} {'html' if v['html'] else 'NOT html'}"
+                        for v in live["html"]),
               None if html_ok else "do not crawl until normal pages return HTML")
     else:
         html_ok = False
@@ -747,7 +763,7 @@ def check_tools(env, m, cfg=None):
     m.data["tools"] = tools
     missing_req = [t for t in REQUIRED_TOOLS if not tools[t]]
     m.add("tools_required", not missing_req, True,
-          "perl, curl, python3 present" if not missing_req else f"missing: {', '.join(missing_req)}")
+          "perl, python3 present" if not missing_req else f"missing: {', '.join(missing_req)}")
     opt = ["gcloud", "dig"] + (["codex"] if mc["codex"]["model"] else []) + \
         (["gemini"] if "gemini" in tools else [])
     missing_opt = [t for t in opt if not tools[t]]
@@ -857,7 +873,9 @@ def _section(text, start_re):
 
 
 def _method_heading_re(heading=None):
-    h = heading or bconf()["method_table_heading"]
+    h = heading if isinstance(heading, str) and heading.strip() else None
+    if h is None:
+        h = bconf()["method_table_heading"]  # the default heading (the loader refuses others)
     return re.compile(r"^##[ \t]+" + re.escape(h.strip()) + r"\b", re.I)
 
 
@@ -966,13 +984,18 @@ def phase1_parse(baseline, prompt_text="", bcfg=None):
                     for rid in expand_ids(bm.group("ids")):
                         add(rid, title, st.group(1) if st else "OPEN", src)
     used_prefixes = set()
-    run_re = re.compile(bc["notes_run_regex"])
+    try:
+        run_re = re.compile(bc["notes_run_regex"])
+    except (TypeError, re.error):
+        run_re = None  # unusable: every note uses its file stem (the loader refuses this)
     for nm in baseline.get("screaming_frog_notes", []):
         t = _read_safe(baseline, os.path.join(baseline.get("baseline_dir", ""), nm))
         if t is None:
             continue
-        rn = run_re.match(nm)
-        prefix = f"R{rn.group(1)}" if rn else nm[:-3]
+        rn = run_re.match(nm) if run_re is not None else None
+        # no group 1, or group 1 unmatched: no run number, never an IndexError
+        run_no = rn.group(1) if rn and rn.re.groups >= 1 else None
+        prefix = f"R{run_no}" if run_no else nm[:-3]
         if prefix in used_prefixes:
             prefix = nm[:-3]
         used_prefixes.add(prefix)
@@ -1012,6 +1035,11 @@ def phase1_markdown(rows, baseline, problems=None, failure=None):
 def build(run_dir, mode, baseline_dir=None, env=None, cfg=None, sfcall=None, first_run=False):
     env = env or Env()
     cfg = cfg or audit_config.load_config()
+    src = cfg.get("_source")
+    if src and src != "defaults":
+        # children (sfcall.sh) must read the same file the manifest loaded, not whatever
+        # $SITE_AUDIT_CONFIG or the default path would give them
+        env.child_env = {audit_config.ENV_VAR: os.path.abspath(src)}
     if baseline_dir is None:
         baseline_dir = audit_config.expand(cfg["baseline"]["dir"], env.home) if cfg["baseline"]["dir"] else None
     man = Manifest()

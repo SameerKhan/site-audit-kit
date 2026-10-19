@@ -61,7 +61,9 @@ class QueryRule(unittest.TestCase):
             self.assertIsNotNone(s.site_url_error(u), u)
 
     def test_no_cache_bust_query_means_no_query(self):
-        cfg = testcfg.load(testcfg.merged(cache_bust_query=None))
+        cfg = testcfg.load(testcfg.merged(cache_bust_query=None, crawl={
+            "health_urls": ["https://www.example.com/", "https://www.example.com/blog/"]},
+            health={"html_urls": ["https://www.example.com/"]}))
         self.assertIsNotNone(s.site_url_error("https://www.example.com/?nocache=1", cfg=cfg))
         self.assertIsNone(s.site_url_error("https://www.example.com/", cfg=cfg))
 

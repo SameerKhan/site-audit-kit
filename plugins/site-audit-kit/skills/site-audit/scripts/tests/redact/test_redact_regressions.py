@@ -475,8 +475,9 @@ class FileSystem(TmpDir):
         self.assert_gone(p)
 
     def test_fix_perms_without_nofollow_chmod_linux_path(self):
-        # Linux has no chmod(follow_symlinks=False); the fallback must still repair a real
-        # directory and never follow a symlink.
+        # Linux has no chmod(follow_symlinks=False); the fallback repairs a real directory
+        # through an O_PATH descriptor and /proc/self/fd, and fails closed (exit 2, nothing
+        # changed by name) where that is unavailable. More cases: test_links_and_chmod.py.
         p = self.write("d/a.csv", f"/r?token={SECRET}\n", mode=0o000)
         os.chmod(os.path.join(self.tmp, "d"), 0o000)
         real_chmod = os.chmod
@@ -488,9 +489,13 @@ class FileSystem(TmpDir):
 
         with mock.patch.object(rx.os, "chmod", linux_chmod):
             rc, out, err = run_cli("--fix-perms", self.tmp)
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmp, "d")).st_mode), 0o700)
-        self.assert_gone(p)
+        if getattr(os, "O_PATH", 0) and os.path.isdir("/proc/self/fd"):
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmp, "d")).st_mode), 0o700)
+            self.assert_gone(p)
+        else:
+            self.assertEqual(rc, 2, err)
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmp, "d")).st_mode), 0o000)
 
     def test_unreadable_without_fix_perms_is_an_error(self):
         self.write("a.csv", f"/r?token={SECRET}\n", mode=0o000)
@@ -528,17 +533,20 @@ class FileSystem(TmpDir):
         self.assertEqual(rc, 1)
         self.assertIn("not a regular file", out)
 
-    def test_hard_link_inside_tree_gets_new_inode(self):
+    def test_hard_link_is_unscanned_never_rewritten(self):
+        # Rewriting one link would leave the raw bytes under every other link.
         p = self.write("a.csv", f"/r?token={SECRET}\n")
         outside = tempfile.mkdtemp()
         try:
             o = os.path.join(outside, "o.csv")
             os.link(p, o)
-            rc, _, err = run_cli(p)
-            self.assertEqual(rc, 0)
-            self.assertIn("hard links", err)
-            self.assert_gone(p)
-            self.assertNotEqual(os.stat(p).st_ino, os.stat(o).st_ino)
+            for args in ([p], ["--check", p]):
+                rc, out, _ = run_cli(*args)
+                self.assertEqual(rc, 1)
+                self.assertIn("UNSCANNED", out)
+                self.assertIn("hard-linked", out)
+            self.assertIn(SECRET.encode(), self.read(p))
+            self.assertEqual(os.stat(p).st_ino, os.stat(o).st_ino)
         finally:
             shutil.rmtree(outside)
 

@@ -2,7 +2,7 @@
   "name": "site-audit-kit",
   "displayName": "Site Audit Kit",
   "description": "Guard-railed technical SEO audits of your own website: an SSRF-safe fetcher with a host allowlist, a read-only SQL guard for WordPress databases, a supervised Screaming Frog MCP crawl with health checks and a hard time limit, an export redactor with a fail-closed check, and a run manifest that pins everything before an audit starts. Standard-library Python, fully tested, configured by one JSON file; with no config the tools allow no hosts.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": {
     "name": "Sameer Ahmed Khan"
   }

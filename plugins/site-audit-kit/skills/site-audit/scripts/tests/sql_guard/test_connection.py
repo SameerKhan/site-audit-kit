@@ -16,6 +16,8 @@ import sql_guard  # noqa: E402
 from sql_guard import GuardedConnection, GuardRejected, GuardSetupError  # noqa: E402
 
 SECRET_ROW = "SECRET-ROW-VALUE-do-not-log"
+BLOG_GRANTS = [("GRANT USAGE ON *.* TO `audit_reader`@`127.0.0.1`",),
+               ("GRANT SELECT ON `audit_blog`.`wp_posts` TO `audit_reader`@`127.0.0.1`",)]
 
 
 class FakeCursor:
@@ -121,7 +123,8 @@ class GuardedConnectionTests(unittest.TestCase):
         conn = FakeConnection(database="audit_site")
         with self.assertRaises(GuardSetupError):
             GuardedConnection(conn, "blog_ro", self.log)
-        GuardedConnection(FakeConnection(database="audit_blog"), "blog_ro", self.log).close()
+        GuardedConnection(FakeConnection(database="audit_blog", grants=BLOG_GRANTS), "blog_ro",
+                          self.log).close()
 
     def test_allowed_statement_runs_and_returns_rows(self):
         conn = FakeConnection()
@@ -212,7 +215,9 @@ class GuardedConnectionTests(unittest.TestCase):
     def test_identity_admin_is_not_select_only(self):
         conn = FakeConnection(grants=[("GRANT ALL PRIVILEGES ON *.* TO `wordpress`@`localhost` "
                                        "WITH GRANT OPTION",)], user="wordpress@localhost")
-        with GuardedConnection(conn, "site", self.log) as g:
+        with self.assertRaises(GuardSetupError):
+            GuardedConnection(conn, "site", self.log)
+        with GuardedConnection(conn, "site", self.log, attended=True) as g:
             ident = g.identity()
         self.assertFalse(ident["select_only"])
 
@@ -220,7 +225,9 @@ class GuardedConnectionTests(unittest.TestCase):
         conn = FakeConnection(grants=[
             ("GRANT USAGE ON *.* TO `audit_reader`@`127.0.0.1`",),
             ("GRANT SELECT ON `wordpress`.`wp_posts` TO `audit_reader`@`127.0.0.1`",)])
-        with GuardedConnection(conn, "site_ro", self.log) as g:
+        with self.assertRaises(GuardSetupError):
+            GuardedConnection(conn, "site_ro", self.log)
+        with GuardedConnection(conn, "site_ro", self.log, attended=True) as g:
             self.assertFalse(g.identity()["select_only"])
 
     def test_reassert_reruns_setup(self):

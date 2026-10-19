@@ -21,16 +21,24 @@ Steps:
      sf_list_crawls lists that id with crawlName == RUNNAME and the id was NOT in the pre-start
      list. Otherwise exit 1 (status "ownership-unproven"), nothing recorded, nothing paused.
      Once an id is recorded, any other running id is not ours (no same-name fallback).
+     Start uncertain: if sf_crawl fails after the request may have been sent (timeout, dropped
+     connection, HTTP error, unparsable reply; anything but a local refusal or a tool error),
+     sf_crawl_progress + sf_list_crawls are checked for up to the start grace (600 s): a running
+     crawl proven ours as above is adopted and supervised; any other running crawl, or no way to
+     verify, => exit 8 (status "pause-not-verified", nothing paused); idle throughout and the list
+     readable => exit 1 (status "failed", nothing is running).
   3. Poll sf_crawl_progress every --poll seconds, one JSON line per poll in <out>/progress.log
      (600): time, state, done, waiting, api message, analysis %, health results. Every round also
      fetches each --health URL (default: crawl.health_urls from the config) through
      safe_fetch.SafeFetcher with a --health-timeout WALL deadline (default 15 s) and at most one
      request in flight per URL; a URL fails on non-200, an error, or a response slower than
      --health-slow (8 s). Two consecutive failed rounds => pause, exit 5. Five consecutive
-     unreachable-server polls => exit 3 (crawl state unknown, NOT paused).
+     unreachable-server polls => exit 3 (crawl state unknown, NOT paused). Once ours is recorded,
+     a reply (active or idle) naming any other databaseId => exit 1, status "ownership-lost";
+     nothing is paused, loaded or exported.
   4. Finished = our crawl was seen active, then the state is idle (or crawl-analysis complete)
-     AND post-crawl analysis is 100%. The --limit-hours hard limit (at most 4) => pause, partial,
-     exit 6.
+     with databaseId == the recorded id AND post-crawl analysis is 100%. The --limit-hours hard
+     limit (at most 4) => pause, partial, exit 6.
   5. TERM / INT / HUP => pause the crawl this process owns (owned in supervise.json AND the
      running databaseId equals the recorded id), verify through sf_crawl_progress that it is no
      longer active (retrying up to --pause-verify-seconds), exit 128+signal (143 TERM, 130 INT,
@@ -43,14 +51,30 @@ Steps:
      and error paths); the file is copied to <out> created 600 from the first byte; then
      redact_exports.py --fix-perms on both copies, then redact_exports.py --check on both copies.
      A missing redactor, a failing run or a --check that does not exit 0 => exit 7,
-     status "export-unredacted".
+     status "export-unredacted". A failed or partial export (the call fails, its reply is lost or
+     unparsable, the file is missing, the copy fails) still gets the lockdown and the redaction
+     gate on whatever was written: clean => exit 1 (status "failed", redact "ok"), else exit 7.
+     When the export outcome is uncertain (its reply lost or unparsable, or the wait for idle
+     after it ended early), sf_crawl_progress is polled first, also on the signal and error
+     paths and even when the crawl itself had finished, until the spider is positively idle
+     (up to --idle-timeout; on a signal at most --pause-verify-seconds). Not verified => no
+     redaction is reported: exit 7, status "export-unredacted", the export may still be writing.
+     Any unexpected error (including an OSError writing supervise.json or progress.log) after
+     sf_crawl runs the same verified pause as a signal: verified => exit 1, else exit 8.
+     URLs written to supervise.json, progress.log, stderr and the dry-run plan have every query
+     value replaced by X (safe_fetch.redact_url); only sf_crawl receives the real start URL.
+     Text from the server (progress messages, error strings, crawl names, replies) gets the same
+     treatment for every http(s) URL inside it before it is stored or printed.
   7. MCP tool ALLOWLIST (a subset of screaming_frog.allowed_tools): sf_crawl_progress, sf_crawl,
      sf_pause_crawl, sf_list_crawls, sf_load_crawl, sf_export_seo_element_urls. Any other name
      raises before a request is made.
-  8. --dry-run validates the arguments, prints the plan and exits 0 without any MCP call.
+  8. --dry-run validates the arguments, prints the plan (with the effective MCP URL: SF_MCP_URL,
+     else screaming_frog.mcp_url) and exits 0 without any MCP call. The effective MCP URL is
+     checked with audit_config.validate_mcp_url (loopback http with a port), in dry-run too.
 
 Argument rules (exit 2 otherwise):
-  --url     https on a crawl.hosts host, or plain http under a crawl.http_paths prefix; no
+  --url     https on a crawl.hosts host, or plain http under a crawl.http_paths prefix (that
+            path may hold no '.' or '..' segment, raw or percent-encoded, and no '//'); no
             userinfo, no port, no fragment, and no query except cache_bust_query exactly.
   --health  the same hosts and rules (test mode also allows http and a port).
   --out     under <run_root>/sf/ (not that folder itself), no symlink in any component below
@@ -69,13 +93,17 @@ overrides are ignored.
 
 Exit codes:
   0   done (crawl complete, loaded; with --export: exported, redacted, --check clean)
-  1   failure (crawl did not start, ownership unproven, recorded crawl id missing, export failed)
+  1   failure (crawl did not start, ownership unproven or lost, recorded crawl id missing,
+      export failed but what it wrote is redacted, unexpected error with our crawl verified stopped);
+      after ownership-unproven or ownership-lost the spider's state is unknown: check the app
   2   usage or preflight refusal
   3   MCP server unreachable (at preflight, or 5 consecutive polls); crawl NOT paused
   5   site health failure, crawl verified paused
   6   hard limit, crawl verified paused, partial
-  7   export-unredacted: redactor missing or failed, or --check not clean (copies are 600)
-  8   pause not verified (server gone, crawl not provably ours, or the pause never landed);
+  7   export-unredacted: redactor missing or failed, --check not clean, or the export may still
+      be writing (spider not verified idle after it); copies are 600
+  8   pause not verified (server gone, crawl not provably ours, the pause never landed, or an
+      uncertain sf_crawl start that could not be reconciled);
       replaces 5, 6 and 128+n whenever the crawl could not be verified stopped
   128+n  stopped by signal n; our crawl verified paused (or not running)
 Python 3 standard library only.
@@ -93,7 +121,7 @@ import sys
 import tempfile
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUNDLED_SFCALL = os.path.join(HERE, "sfcall.sh")
@@ -151,11 +179,81 @@ def sf_root():
     """<run_root>/sf, expanded against the current $HOME."""
     import audit_config  # noqa: E402 - imported by config()
     return os.path.join(audit_config.run_root(config()), "sf")
+
+
+def red(url):
+    """url for logs, state and the plan: every query value replaced by X, no userinfo or fragment
+    (safe_fetch.redact_url). Falls back to replacing the whole query when safe_fetch is unavailable."""
+    try:
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import safe_fetch  # noqa: E402 - sibling module
+        return safe_fetch.redact_url(url)
+    except Exception:  # noqa: BLE001 - never let logging fail open
+        try:
+            parts = urlsplit(str(url))
+        except ValueError:
+            return "<unparseable-url>"
+        return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path,
+                           "X" if parts.query else "", ""))
+
+
+URL_IN_TEXT_RE = re.compile(r"(?i)\bhttps?://[^\s\"'<>]+")
+
+
+def scrub_text(text):
+    """Free text (server replies, error strings, crawl names) with every http(s) URL in it
+    passed through red(): query values become X, no userinfo or fragment."""
+    return URL_IN_TEXT_RE.sub(lambda mo: red(mo.group(0)), str(text))
+
+
+def scrub_obj(obj):
+    """A copy of obj (dicts, lists, strings) with scrub_text applied to every string."""
+    if isinstance(obj, str):
+        return scrub_text(obj)
+    if isinstance(obj, dict):
+        return {scrub_text(k) if isinstance(k, str) else k: scrub_obj(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [scrub_obj(v) for v in obj]
+    return obj
+
+
+def effective_mcp_url():
+    """(url, source): SF_MCP_URL when set, else screaming_frog.mcp_url (what sfcall.sh uses).
+    Both are validated with audit_config.validate_mcp_url (raises ConfigError when invalid)."""
+    import audit_config  # noqa: E402 - imported by config()
+    cfg_url = config()["screaming_frog"]["mcp_url"]
+    if cfg_url:
+        audit_config.validate_mcp_url(cfg_url)
+    env = os.environ.get("SF_MCP_URL")
+    if env:
+        return audit_config.validate_mcp_url(env), "SF_MCP_URL"
+    return audit_config.validate_mcp_url(cfg_url), "config screaming_frog.mcp_url"
+
+
+def path_error(path):
+    """None if an http path is free of dot segments and empty segments, else the reason. Checked
+    raw and after each round of percent-decoding, so %2e%2e and %252e%252e are caught too."""
+    seen = path
+    for _ in range(5):
+        if "//" in seen:
+            return "the path has an empty segment ('//')"
+        if any(seg in (".", "..") for seg in seen.split("/")):
+            return "the path has a dot segment ('.' or '..')"
+        nxt = unquote(seen)
+        if nxt == seen:
+            return None
+        seen = nxt
+    return "the path is percent-encoded too many times"
 BUSY_RE = re.compile(r"spider busy|cannot be called currently|\bbusy\b", re.I)
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MAX_LIMIT_HOURS = 4.0
 UNREACHABLE_POLLS = 5
 REDACT_TIMEOUT = 1800.0
+
+EXPORT_UNSETTLED_MSG = ("the export may still be writing: the spider was not verified idle after "
+                        "sf_export_seo_element_urls, so nothing was redacted or checked. Do not use or "
+                        "share the export folder or the run folder; check the Screaming Frog app")
 
 (EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_UNREACHABLE, EXIT_HEALTH, EXIT_LIMIT, EXIT_UNREDACTED,
  EXIT_PAUSE_UNVERIFIED) = 0, 1, 2, 3, 5, 6, 7, 8
@@ -174,7 +272,9 @@ class Abort(Exception):
 
 class McpError(Exception):
     def __init__(self, tool, rc, text):
-        super().__init__(f"{tool}: sfcall exit {rc}: {text[:400]}")
+        # str(e) reaches logs and state, so URLs in the server's text are redacted there; the raw
+        # text stays in .text for the busy check only.
+        super().__init__(scrub_text(f"{tool}: sfcall exit {rc}: {text[:400]}"))
         self.tool, self.rc, self.text = tool, rc, text
 
 
@@ -183,7 +283,7 @@ def now_iso():
 
 
 def log(msg):
-    print(f"[sf_supervise {datetime.datetime.now():%H:%M:%S}] {msg}", file=sys.stderr, flush=True)
+    print(f"[sf_supervise {datetime.datetime.now():%H:%M:%S}] {scrub_text(msg)}", file=sys.stderr, flush=True)
 
 
 def write_private(path, text):
@@ -305,6 +405,9 @@ def site_url_error(url, allow_test=False, cfg=None):
         return None  # test mode: any scheme/path on the allowed host with a port (loopback only)
     if scheme == "http":
         path = parts.path
+        perr = path_error(path)
+        if perr:
+            return perr
         if not any(e["host"] == host and (path == e["path_prefix"] or path.startswith(e["path_prefix"] + "/"))
                    for e in cfg["crawl"]["http_paths"]):
             return "plain http is only allowed under a configured crawl.http_paths prefix"
@@ -390,6 +493,8 @@ class State:
     def __init__(self, path):
         self.path = path
         self.data = {}
+        self.tolerant = False  # set during cleanup: a failed write is logged, never raised
+
 
     def load(self):
         try:
@@ -404,7 +509,12 @@ class State:
     def save(self, **kw):
         self.data.update(kw)
         self.data["updated_at"] = now_iso()
-        write_private(self.path, json.dumps(self.data, indent=2) + "\n")
+        try:
+            write_private(self.path, json.dumps(scrub_obj(self.data), indent=2) + "\n")
+        except OSError as e:
+            if not self.tolerant:
+                raise
+            log(f"LOUD: cannot write {self.path}: {e}")
 
     def event(self, kind, **kw):
         ev = {"time": now_iso(), "event": kind}
@@ -496,12 +606,17 @@ def analysis_pct(prog):
 
 
 def summary(prog):
+    """The fields logged per poll; every string from the server is URL-redacted (scrub_obj)."""
     cp = (prog or {}).get("crawlProgress") or {}
     ap = (prog or {}).get("apiProgress") or {}
-    return {"state": state_name(prog) or None, "done": cp.get("completed"),
-            "waiting": cp.get("waiting"), "crawl_pct": cp.get("percentComplete"),
-            "api": ap.get("message"), "api_pct": ap.get("percentComplete"),
-            "analysis": analysis_pct(prog), "database_id": (prog or {}).get("databaseId")}
+    if not isinstance(cp, dict):
+        cp = {}
+    if not isinstance(ap, dict):
+        ap = {}
+    return scrub_obj({"state": state_name(prog) or None, "done": cp.get("completed"),
+                      "waiting": cp.get("waiting"), "crawl_pct": cp.get("percentComplete"),
+                      "api": ap.get("message"), "api_pct": ap.get("percentComplete"),
+                      "analysis": analysis_pct(prog), "database_id": (prog or {}).get("databaseId")})
 
 
 # ---------------------------------------------------------------- health
@@ -521,7 +636,7 @@ class HealthMonitor:
 
     @staticmethod
     def _fail(url, err, secs=None):
-        return {"url": url, "status": None, "seconds": secs, "ok": False, "error": err}
+        return {"url": red(url), "status": None, "seconds": secs, "ok": False, "error": err}
 
     def _one(self, url, box):
         t0 = time.monotonic()
@@ -531,7 +646,7 @@ class HealthMonitor:
             status = getattr(r, "status", None)
             err = getattr(r, "error", None)
             ok = bool(getattr(r, "ok", False)) and status == 200 and err is None and secs <= self.slow
-            out = {"url": url, "status": status, "seconds": secs, "ok": ok,
+            out = {"url": red(url), "status": status, "seconds": secs, "ok": ok,
                    "elapsed_ms": getattr(r, "elapsed_ms", None)}
             if err:
                 out["error"] = str(err)[:160]
@@ -581,6 +696,7 @@ class Supervisor:
         self.crawl_requested = False   # sf_crawl was sent (it may have started a crawl)
         self.crawl_finished = False    # our crawl reached idle + analysis 100%
         self.export_started = False    # sf_export_seo_element_urls was sent
+        self.export_settled = False    # ...and the spider was verified idle afterwards
         self.redact_result = None      # result of the last redaction gate
         self.health = None
 
@@ -610,6 +726,11 @@ class Supervisor:
         verified = True if self.crawl_finished else self.pause_owned(f"signal {name}")
         self.state.save(signal=name, paused_on_signal=verified)
         if self.export_started:
+            if not self.export_quiet(min(self.a.idle_timeout, self.a.pause_verify_seconds)):
+                lock_tree(self.sf_dir)
+                self.redact_result = "export-may-be-writing"
+                self.state.save(status="export-unredacted", redact=self.redact_result)
+                raise Abort(EXIT_UNREDACTED, f"stopped by {name}; {EXPORT_UNSETTLED_MSG}")
             if self.redact_result != "ok":
                 self.redact_result = self.redact_gate([self.sf_dir, self.out])
             if self.redact_result != "ok":
@@ -638,7 +759,7 @@ class Supervisor:
         fd = os.open(self.progress_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, (json.dumps(rec) + "\n").encode())
+            os.write(fd, (json.dumps(scrub_obj(rec)) + "\n").encode())
         finally:
             os.close(fd)
 
@@ -781,11 +902,12 @@ class Supervisor:
         except McpError as e:
             raise Abort(EXIT_UNREACHABLE if e.rc == 3 else EXIT_FAIL, f"preflight sf_list_crawls failed: {e}")
         self.state.data = {}
-        self.state.save(name=self.a.name, url=self.a.url, config=self.a.config, out=self.out,
+        self.state.save(name=self.a.name, url=red(self.a.url), config=self.a.config, out=self.out,
                         sf_export_dir=self.sf_dir, pid=os.getpid(), owned=False, status="starting",
                         started_at=now_iso(), preflight_state=state_name(prog),
                         preflight_database_id=prog.get("databaseId"), prestart_crawl_ids=prestart,
-                        limit_hours=self.a.limit_hours, poll=self.a.poll, health=self.a.health)
+                        limit_hours=self.a.limit_hours, poll=self.a.poll,
+                        health=[red(u) for u in self.a.health])
         self.state.event("preflight_ok", state=state_name(prog))
         return prog
 
@@ -796,19 +918,86 @@ class Supervisor:
         try:
             text = self.mcp.call("sf_crawl", args, busy_retry=False)
         except McpError as e:
-            self.crawl_requested = False  # rejected: nothing was started by us
-            self.state.save(status="failed", error=f"sf_crawl failed: {e}")
-            raise Abort(EXIT_FAIL, f"sf_crawl failed: {e}")
+            if e.rc in (2, 4):
+                # refused locally (2) or answered with a tool / JSON-RPC error (4): nothing started
+                self.crawl_requested = False
+                self.state.save(status="failed", error=f"sf_crawl failed: {self._scrub(str(e))}")
+                raise Abort(EXIT_FAIL, f"sf_crawl failed: {self._scrub(str(e))}")
+            # timeout, dropped connection, HTTP error or an unparsable reply: the request may have
+            # been executed, so never assume that nothing started.
+            self.reconcile_start(e)
+            return
         # Not owned yet: ownership is proven at the first SpiderActiveState (claim()).
         self.state.save(status="running", crawl_requested=True, crawl_started_at=now_iso())
-        self.state.event("crawl_requested", reply=text[:300])
-        log(f"crawl {self.a.name} requested: {text[:200]}")
+        self.state.event("crawl_requested", reply=self._scrub(text)[:300])
+        log(f"crawl {self.a.name} requested: {self._scrub(text)[:200]}")
+
+    def _scrub(self, text):
+        """text with the start URL, and every other URL in it, in redacted form."""
+        text = str(text).replace(self.a.url, red(self.a.url)) if self.a.url else str(text)
+        return scrub_text(text)
+
+    def reconcile_start(self, err):
+        """sf_crawl failed after the request may have been sent. For up to --start-grace seconds:
+        a running crawl that claim() proves ours is adopted and supervised; any other running crawl
+        => exit 8 (not provably ours, not paused). Idle for the whole window AND sf_list_crawls
+        readable => exit 1 (nothing of ours is running). Anything unverifiable => exit 8."""
+        why = self._scrub(str(err))[:300]
+        self.state.save(status="start-uncertain", crawl_requested=True, error=f"sf_crawl failed: {why}")
+        self.state.event("start_uncertain", why=why)
+        log(f"LOUD: sf_crawl failed after the request may have been sent ({why}); "
+            f"checking for up to {self.a.start_grace}s whether a crawl started")
+        end = time.monotonic() + self.a.start_grace
+        last = "no reply"
+        idle = False
+        while True:
+            self.check_signal()
+            try:
+                prog = self.progress()
+            except McpError as e:
+                prog, idle, last = None, False, f"progress unavailable: {str(e)[:200]}"
+            if prog is not None and is_active(prog):
+                ok, cwhy = self.claim(prog)
+                if ok:
+                    self.state.save(status="running", crawl_started_at=now_iso(), start_reconciled=True)
+                    self.state.event("start_reconciled", database_id=prog.get("databaseId"))
+                    log(f"crawl {self.a.name} found running as {prog.get('databaseId')}; supervising it")
+                    return
+                msg = (f"start uncertain: sf_crawl failed ({why}) and a crawl is running whose ownership "
+                       f"cannot be proven ({cwhy}); NOT pausing it. Check the Screaming Frog app now.")
+                self.state.save(status="pause-not-verified", reason=msg, paused=False)
+                raise Abort(EXIT_PAUSE_UNVERIFIED, msg)
+            if prog is not None:
+                idle, last = is_idle(prog), f"state {state_name(prog) or 'unknown'}"
+            if time.monotonic() >= end:
+                break
+            self.sleep(min(self.a.poll, 1.0))
+        if idle:
+            try:
+                crawls = self.list_crawls()
+            except McpError as e:
+                crawls, last = None, f"sf_list_crawls failed: {str(e)[:200]}"
+            if crawls is not None:
+                pre = set(self.state.data.get("prestart_crawl_ids") or [])
+                new = [c.get("instanceDirName") for c in crawls
+                       if c.get("crawlName") == self.a.name and c.get("instanceDirName") not in pre]
+                self.crawl_requested = False
+                msg = (f"sf_crawl failed ({why}); the spider stayed idle for {self.a.start_grace}s, so "
+                       "nothing is running" + (f" (new crawl(s) named {self.a.name} listed but not running: "
+                                               f"{', '.join(map(str, new))})" if new else
+                                               f" and no new crawl named {self.a.name} is listed"))
+                self.state.save(status="failed", error=msg, new_crawl_ids=new)
+                raise Abort(EXIT_FAIL, msg)
+        msg = (f"start uncertain: sf_crawl failed ({why}) and it could not be verified that no crawl "
+               f"started ({last}). Check the Screaming Frog app now.")
+        self.state.save(status="pause-not-verified", reason=msg, paused=False)
+        raise Abort(EXIT_PAUSE_UNVERIFIED, msg)
 
     def monitor(self):
         t0 = time.monotonic()
         deadline = t0 + self.a.limit_hours * 3600
-        seen_active = False
-        foreign_logged = False
+        # an uncertain start reconciled by reconcile_start() was already seen active and claimed
+        seen_active = bool(self.state.data.get("owned") and self.state.data.get("database_id"))
         fails = 0
         progress_errors = 0
         unreachable = 0
@@ -849,11 +1038,17 @@ class Supervisor:
                 self.state.save(seen_active_at=now_iso())
                 self.state.event("active", database_id=prog.get("databaseId"))
             mine = self.state.data.get("database_id")
-            if seen_active and prog is not None and is_active(prog) and prog.get("databaseId") \
-                    and prog.get("databaseId") != mine and not foreign_logged:
-                foreign_logged = True
-                self.state.event("foreign_active", database_id=prog.get("databaseId"), ours=mine)
-                log(f"LOUD: a different crawl ({prog.get('databaseId')}) is running, not ours ({mine})")
+            if seen_active and prog is not None and (is_active(prog) or is_idle(prog)) \
+                    and prog.get("databaseId") != mine:
+                # Once ours is recorded, any other id (active or idle) means the spider is no longer
+                # on our crawl: its state says nothing about ours. Stop; never load or export.
+                other = prog.get("databaseId")
+                msg = (f"ownership lost: the spider now reports database id {other!r} "
+                       f"({state_name(prog) or 'unknown'}), not ours ({mine}). Not pausing, loading or "
+                       "exporting anything; check the Screaming Frog app.")
+                self.state.event("ownership_lost", database_id=other, ours=mine, state=state_name(prog))
+                self.state.save(status="ownership-lost", error=msg)
+                raise Abort(EXIT_FAIL, msg)
             if fails >= 2:
                 bad = [r for r in results if not r["ok"]]
                 reason = "site health failed two consecutive rounds: " + "; ".join(
@@ -866,6 +1061,7 @@ class Supervisor:
                 self.state.save(status="paused-health", reason=reason, paused=True)
                 raise Abort(EXIT_HEALTH, reason + "; crawl paused")
             if seen_active and prog is not None and not is_active(prog) and is_idle(prog) \
+                    and prog.get("databaseId") == mine \
                     and analysis_pct(prog) is not None and analysis_pct(prog) >= 100:
                 self.crawl_finished = True
                 self.state.save(status="crawl-complete", finished_at=now_iso(), final=summary(prog))
@@ -889,7 +1085,9 @@ class Supervisor:
                 raise Abort(EXIT_LIMIT, reason + "; crawl paused and marked partial")
             self.sleep(self.a.poll)
 
-    def wait_idle(self, what, timeout=None):
+    def wait_idle(self, what, timeout=None, strict=False):
+        """Poll until the spider is not active (strict: positively idle, an unknown state does not
+        count). Abort on timeout or 5 unreachable polls."""
         timeout = self.a.idle_timeout if timeout is None else timeout
         end = time.monotonic() + timeout
         unreachable = 0
@@ -898,7 +1096,7 @@ class Supervisor:
             try:
                 prog = self.progress()
                 unreachable = 0
-                if not is_active(prog):
+                if not is_active(prog) and (is_idle(prog) or not strict):
                     return prog
             except McpError as e:
                 unreachable = unreachable + 1 if e.rc == 3 else 0
@@ -909,6 +1107,33 @@ class Supervisor:
             if time.monotonic() >= end:
                 raise Abort(EXIT_FAIL, f"spider not idle {timeout}s after {what}")
             self.sleep(min(self.a.poll, 5.0))
+
+    def export_quiet(self, timeout):
+        """True when the export is known to have stopped writing: wait_idle("export") returned,
+        or sf_crawl_progress shows the spider positively idle within timeout seconds. Never
+        checks for a signal (it runs inside the signal and error cleanup)."""
+        if self.export_settled:
+            return True
+        end = time.monotonic() + timeout
+        last = "no reply"
+        while True:
+            try:
+                prog = self.progress()
+                if is_idle(prog) and not is_active(prog):
+                    self.export_settled = True
+                    self.state.event("export_idle_verified", state=state_name(prog))
+                    return True
+                last = f"state {state_name(prog) or 'unknown'}"
+            except McpError as e:
+                last = f"progress unavailable: {str(e)[:200]}"
+            except Exception as e:  # noqa: BLE001 - cleanup path: unverified, never raised
+                last = f"{type(e).__name__}: {str(e)[:200]}"
+            if time.monotonic() >= end:
+                break
+            time.sleep(min(max(self.a.poll, 0.05), 1.0))
+        self.state.event("export_idle_unverified", why=last, seconds=timeout)
+        log(f"LOUD: the spider was not verified idle {timeout}s after the export ({last})")
+        return False
 
     def find_crawl_id(self):
         mine = self.state.data.get("database_id")
@@ -969,7 +1194,8 @@ class Supervisor:
             raise Abort(EXIT_FAIL, f"export reported {src} but the file does not exist")
         if not stat.S_ISREG(sst.st_mode):
             raise Abort(EXIT_FAIL, f"export {src} is not a regular file")
-        self.wait_idle("export")
+        self.wait_idle("export", strict=True)
+        self.export_settled = True
         lock_tree(self.sf_dir)
         dst = os.path.join(self.out, "internal_all.ndjson")
         copy_private(src_real, dst)
@@ -1012,7 +1238,8 @@ class Supervisor:
             return f"fix-failed:{err}"
         self.state.event("redacted", rc=p.returncode, stderr=(p.stderr or "")[-300:])
         if p.returncode != 0:
-            print(f"WARNING: redact_exports.py exited {p.returncode}: {(p.stderr or '')[-300:]}", file=sys.stderr)
+            print(f"WARNING: redact_exports.py exited {p.returncode}: {scrub_text((p.stderr or '')[-300:])}",
+                  file=sys.stderr)
             return f"fix-failed:{p.returncode}"
         p, err = self._redactor(paths, "--check")
         if err:
@@ -1044,25 +1271,94 @@ class Supervisor:
         for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(s, self.on_signal)
         try:
-            self.prepare_out()
-            self.preflight()
-            self.check_signal()
-            self.start()
-            self.monitor()
-            self.load_and_export()
-            self.check_signal()
-            log(f"done: {self.state.path}")
-            return EXIT_OK
-        except Abort as e:
-            log(str(e))
-            return e.code
-        except McpError as e:
-            self.state.save(status="failed", error=str(e)[:500])
-            log(f"failed: {e}")
-            return EXIT_FAIL
+            try:
+                self.prepare_out()
+                self.preflight()
+                self.check_signal()
+                self.start()
+                self.monitor()
+                self.load_and_export()
+                self.check_signal()
+                log(f"done: {self.state.path}")
+                code = EXIT_OK
+            except Abort as e:
+                log(str(e))
+                code = e.code
+            except (KeyboardInterrupt, SystemExit) as e:
+                # handled like the matching signal: verified pause of our crawl, then 128+n or 8
+                if self.signum is None:
+                    self.signum = signal.SIGINT if isinstance(e, KeyboardInterrupt) else signal.SIGTERM
+                code = self.cleanup_signal()
+            except Exception as e:  # noqa: BLE001 - McpError, OSError and any bug: same cleanup
+                code = self.cleanup_error(e)
+            return self.final_export_gate(code)
         finally:
             if self.export_started:
                 lock_tree(self.sf_dir)
+
+    def cleanup_signal(self):
+        self.state.tolerant = True
+        try:
+            self.check_signal()
+        except Abort as a:
+            log(str(a))
+            return a.code
+        except Exception as e:  # noqa: BLE001
+            log(f"LOUD: cleanup after the signal failed: {type(e).__name__}: {e}")
+            return EXIT_PAUSE_UNVERIFIED if self.crawl_requested and not self.crawl_finished else 128 + self.signum
+        return 128 + self.signum
+
+    def cleanup_error(self, e):
+        """Any unexpected error: never leave a crawl we may have started running unverified."""
+        self.state.tolerant = True
+        what = "failed" if isinstance(e, McpError) else "unexpected error"
+        msg = self._scrub(f"{what}: {type(e).__name__}: {e}")[:500]
+        log(f"LOUD: {msg}")
+        if self.crawl_requested and not self.crawl_finished:
+            try:
+                verified = self.pause_owned(what)
+            except Exception as e2:  # noqa: BLE001
+                log(f"LOUD: pause after the error failed: {type(e2).__name__}: {e2}")
+                verified = False
+            if not verified:
+                self.state.save(status="pause-not-verified", error=msg, paused=False)
+                log("LOUD: the crawl was NOT verified paused. Check the Screaming Frog app now.")
+                return EXIT_PAUSE_UNVERIFIED
+            self.state.save(status="failed", error=msg, paused=True)
+            log("our crawl is not running (verified)")
+            return EXIT_FAIL
+        self.state.save(status="failed", error=msg)
+        return EXIT_FAIL
+
+    def final_export_gate(self, code):
+        """An export that was started but did not finish cleanly (failed or partial call, missing
+        file, copy error, any error) still gets the lockdown and the redaction gate on whatever was
+        written. Not clean => exit 7, status export-unredacted."""
+        if code == EXIT_OK or not self.export_started or self.redact_result is not None:
+            return code
+        self.state.tolerant = True
+        lock_tree(self.sf_dir)
+        lock_tree(self.out)
+        # The export may still be writing (reply lost, wait timed out): verify idle first,
+        # whether or not the crawl itself had finished.
+        if not self.export_quiet(self.a.idle_timeout):
+            lock_tree(self.sf_dir)
+            lock_tree(self.out)
+            self.redact_result = "export-may-be-writing"
+            self.state.save(status="export-unredacted", redact=self.redact_result)
+            log(f"LOUD: {EXPORT_UNSETTLED_MSG}")
+            return EXIT_UNREDACTED
+        try:
+            self.redact_result = self.redact_gate([self.sf_dir, self.out])
+        except Exception as e:  # noqa: BLE001
+            self.redact_result = f"error:{type(e).__name__}"
+        if self.redact_result != "ok":
+            self.state.save(status="export-unredacted", redact=self.redact_result)
+            log(f"LOUD: the export did not finish and what it wrote is NOT verified redacted "
+                f"({self.redact_result}); do not use or share {self.sf_dir} or {self.out}")
+            return EXIT_UNREDACTED
+        self.state.save(redact="ok")
+        return code
 
 
 # ---------------------------------------------------------------- CLI
@@ -1100,7 +1396,7 @@ def parse(argv):
     try:
         cfg = config()
     except Exception as e:  # noqa: BLE001 - any config problem is a usage error
-        print(f"sf_supervise: config error: {e}", file=sys.stderr)
+        print(f"sf_supervise: config error: {scrub_text(e)}", file=sys.stderr)
         sys.exit(EXIT_USAGE)
     default_base = cfg["screaming_frog"]["base_dir"]
     default_base = os.path.abspath(os.path.expanduser(default_base)) if default_base else None
@@ -1114,7 +1410,7 @@ def parse(argv):
         errs.append(f"--config is not a .seospiderconfig file: {a.config}")
     e = site_url_error(a.url)
     if e:
-        errs.append(f"--url {a.url!r} refused: {e}")
+        errs.append(f"--url {red(a.url)!r} refused: {e}")
     for flag in ("limit_hours", "poll", "health_timeout", "health_slow", "start_grace",
                  "pause_verify_seconds", "idle_timeout", "busy_base", "busy_budget"):
         v = getattr(a, flag)
@@ -1136,7 +1432,7 @@ def parse(argv):
     for u in a.health:
         e = site_url_error(u, allow_test=test)
         if e:
-            errs.append(f"--health {u!r} refused: {e}")
+            errs.append(f"--health {red(u)!r} refused: {e}")
     a.out = os.path.abspath(os.path.expanduser(a.out or os.path.join(sf_root(), f"run-{a.name}")))
     if NAME_RE.match(a.name):
         e = out_error(a.out, a.name)
@@ -1149,29 +1445,39 @@ def parse(argv):
         errs.append(f"--sf-base must be {default_base} (got {a.sf_base})")
     elif not os.path.isdir(a.sf_base) and not a.dry_run:
         errs.append(f"--sf-base does not exist: {a.sf_base}")
+    try:
+        effective_mcp_url()
+    except Exception as e:  # noqa: BLE001 - audit_config.ConfigError
+        src = "SF_MCP_URL" if os.environ.get("SF_MCP_URL") else "screaming_frog.mcp_url"
+        errs.append(f"{src} refused: {scrub_text(e)}")
     if errs:
-        for e in errs: print("sf_supervise: " + e, file=sys.stderr)
+        for e in errs: print("sf_supervise: " + scrub_text(e), file=sys.stderr)
         sys.exit(EXIT_USAGE)
     return a
 
 
 def plan(a):
     rel = f"run-{a.name}/internal_all.ndjson"
+    mcp_url, mcp_src = effective_mcp_url()
+    crawl_args = {"crawl_url": red(a.url), "config_path": a.config, "crawl_name": a.name,
+                  "project_name": config()["screaming_frog"]["project_name"]}
     lines = [
         "sf_supervise plan (dry run: no MCP call, no crawl)",
         f"  run name        {a.name}",
-        f"  start URL       {a.url}",
+        f"  start URL       {red(a.url)}  (query values shown as X)",
         f"  config          {a.config} (absolute, exists)",
         f"  out dir         {a.out} (700; supervise.json + progress.log 600)",
         f"  sfcall          {sfcall_path()} ({'present' if os.access(sfcall_path(), os.X_OK) else 'MISSING'}); "
-        f"SF_MCP_URL={os.environ.get('SF_MCP_URL', 'http://127.0.0.1:11435/mcp (default)')}",
+        f"MCP server {red(mcp_url)} (from {mcp_src})",
         f"  limits          poll {a.poll}s, hard limit {a.limit_hours}h, health wall deadline {a.health_timeout}s, "
         f"slow > {a.health_slow}s",
-        "  health URLs     " + ", ".join(a.health) + " (safe_fetch.SafeFetcher)",
+        "  health URLs     " + ", ".join(red(u) for u in a.health) + " (safe_fetch.SafeFetcher)",
         "",
         "  1. preflight    sf_crawl_progress must show an idle spider (else exit 2); sf_list_crawls recorded;"
         " supervise.json owned=false",
-        f"  2. start        sf_crawl {json.dumps({'crawl_url': a.url, 'config_path': a.config, 'crawl_name': a.name, 'project_name': config()['screaming_frog']['project_name']})}",
+        f"  2. start        sf_crawl {json.dumps(crawl_args)}",
+        "                  a lost or unparsable reply => reconcile for the start grace: our crawl found =>"
+        " supervised; another running crawl or no verification => exit 8; idle throughout => exit 1",
         "                  owned=true only when the running id is listed with this name and was not listed"
         " before (else exit 1)",
         f"  3. poll         sf_crawl_progress + health every {a.poll}s -> progress.log; 2 failed health rounds"
@@ -1179,7 +1485,8 @@ def plan(a):
         "  4. finish       our crawl seen active, then idle AND post-crawl analysis 100%;"
         f" after {a.limit_hours}h => pause, partial, exit 6",
         "  5. signals      TERM/INT/HUP => pause our crawl only (recorded database id), verify inactive, exit 128+n",
-        "                  any pause that cannot be verified => exit 8",
+        "                  any pause that cannot be verified => exit 8; any other id after ownership =>"
+        " ownership-lost, exit 1",
         f"  6. load         sf_list_crawls must list the recorded id named {a.name} -> sf_load_crawl crawl_id",
     ]
     if a.export:

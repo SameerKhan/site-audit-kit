@@ -38,12 +38,17 @@ if git ls-files 2>/dev/null | grep -E '(__pycache__/|\.pyc$)'; then err "compile
 
 # 6. Every test suite passes with an empty HOME and no config.
 home=$(mktemp -d)
+cleanup() { rm -rf "$home" "$SKILL/scripts/tests/_tmp"; }
+trap cleanup EXIT
+trap 'cleanup; trap - EXIT; exit 130' INT
+trap 'cleanup; trap - EXIT; exit 143' TERM
+trap 'cleanup; trap - EXIT; exit 129' HUP
 for suite in config safe_fetch sql_guard redact manifest sf_supervise; do
   (cd "$SKILL/scripts" && env -u SITE_AUDIT_CONFIG HOME="$home" PYTHONDONTWRITEBYTECODE=1 \
     python3 -m unittest discover -s "tests/$suite" > "$home/$suite.log" 2>&1) \
     || { err "tests failed: $suite"; grep -E '^(FAIL|ERROR):' -A 25 "$home/$suite.log" | head -80; }
 done
-rm -rf "$home" "$SKILL/scripts/tests/_tmp"
+cleanup
 
 if [ "$fail" -ne 0 ]; then exit 1; fi
 echo "all checks passed"
