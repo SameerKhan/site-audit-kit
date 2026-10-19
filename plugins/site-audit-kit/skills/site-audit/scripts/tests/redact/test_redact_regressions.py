@@ -44,8 +44,10 @@ class TmpDir(unittest.TestCase):
     def tearDown(self):
         for root, dirs, files in os.walk(self.tmp):
             for d in dirs:
+                p = os.path.join(root, d)
                 try:
-                    os.chmod(os.path.join(root, d), 0o700, follow_symlinks=False)
+                    if not os.path.islink(p):
+                        os.chmod(p, 0o700)
                 except OSError:
                     pass
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -470,6 +472,24 @@ class FileSystem(TmpDir):
         self.assertEqual(rc, 0, err)
         self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmp, "d")).st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+        self.assert_gone(p)
+
+    def test_fix_perms_without_nofollow_chmod_linux_path(self):
+        # Linux has no chmod(follow_symlinks=False); the fallback must still repair a real
+        # directory and never follow a symlink.
+        p = self.write("d/a.csv", f"/r?token={SECRET}\n", mode=0o000)
+        os.chmod(os.path.join(self.tmp, "d"), 0o000)
+        real_chmod = os.chmod
+
+        def linux_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
+            if not follow_symlinks:
+                raise NotImplementedError("chmod: follow_symlinks unavailable on this platform")
+            return real_chmod(path, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(rx.os, "chmod", linux_chmod):
+            rc, out, err = run_cli("--fix-perms", self.tmp)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmp, "d")).st_mode), 0o700)
         self.assert_gone(p)
 
     def test_unreadable_without_fix_perms_is_an_error(self):

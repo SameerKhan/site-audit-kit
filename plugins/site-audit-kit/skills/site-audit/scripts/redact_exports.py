@@ -630,11 +630,24 @@ class Run:
 
     def _chmod_nofollow(self, dirfd, name, mode, path):
         try:
-            os.chmod(name, mode, dir_fd=dirfd, follow_symlinks=False)
+            try:
+                os.chmod(name, mode, dir_fd=dirfd, follow_symlinks=False)
+            except NotImplementedError:
+                # Linux has no no-follow chmod. Only a real directory or regular file is
+                # changed (never a symlink): check the entry before, chmod relative to the open
+                # parent, and confirm it is still the same object afterwards.
+                before = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+                if not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)):
+                    raise OSError(0, "not a regular file or directory")
+                os.chmod(name, mode, dir_fd=dirfd)
+                after = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+                if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) or \
+                        stat.S_IFMT(after.st_mode) != stat.S_IFMT(before.st_mode):
+                    raise OSError(0, "entry changed during chmod")
             self.s["perms_fixed"] += 1
             return True
-        except (OSError, NotImplementedError) as e:
-            self.errors.append(f"{path}: chmod failed: {getattr(e, 'strerror', e)}")
+        except OSError as e:
+            self.errors.append(f"{path}: chmod failed: {getattr(e, 'strerror', None) or e}")
             return False
 
     def _open_dir(self, dirfd, name, path, st):
