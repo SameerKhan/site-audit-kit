@@ -1,0 +1,54 @@
+{
+  "_comment": "Copy to ~/.config/site-audit-kit/config.json, chmod 600, and replace every your-site.example value with your own site. The .example names never resolve, so this file fetches and crawls nothing until you edit it. Unknown keys are refused. See README.md for every key.",
+
+  "allowed_hosts": ["www.your-site.example", "your-site.example", "help.your-site.example"],
+  "owned_domains": ["your-site.example"],
+  "forbidden_hosts": ["old.your-site.example"],
+  "forbid_subdomains_of_forbidden": true,
+  "probe_paths": {"old.your-site.example": ["/"]},
+  "cache_bust_query": "nocache=1",
+  "run_root": "~/site-audit",
+
+  "crawl": {
+    "hosts": ["www.your-site.example", "help.your-site.example"],
+    "http_paths": [{"host": "www.your-site.example", "path_prefix": "/blog"}],
+    "health_urls": ["https://www.your-site.example/?nocache=1", "https://www.your-site.example/blog/?nocache=1"]
+  },
+
+  "health": {
+    "status_urls": ["https://www.your-site.example/robots.txt", "https://www.your-site.example/sitemap.xml"],
+    "html_urls": ["https://www.your-site.example/", "https://www.your-site.example/blog/?nocache=1"]
+  },
+
+  "screaming_frog": {
+    "mcp_url": "http://127.0.0.1:11435/mcp",
+    "base_dir": "~/screaming-frog-mcp",
+    "profiles_dir": "~/screaming-frog-mcp",
+    "project_name": "site-audit"
+  },
+
+  "baseline": {
+    "dir": "~/site-audit/reports",
+    "findings_regex": "^site-audit-(?P<date>\\d{4}-\\d{2}-\\d{2})(?:-(?P<n>\\d+))?\\.md$",
+    "companion_suffixes": ["runbook", "decisions", "baseline-delta"],
+    "review_heading": "review record",
+    "fallback_file": null,
+    "method_table_file": null
+  },
+
+  "models": {
+    "gemini": {"model": "", "binary": "", "list_args": []},
+    "codex": {"model": "", "binary": "codex"}
+  },
+
+  "db": {
+    "config_file": null,
+    "readonly_aliases": [],
+    "public_post_types": ["post", "page"],
+    "installs": {}
+  },
+
+  "redaction": {
+    "extra_params": []
+  }
+}
